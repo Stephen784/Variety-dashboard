@@ -1,25 +1,21 @@
 # app.py
-import os
 import logging
-import base64
-import tempfile
-from io import BytesIO
-
 import pandas as pd
 import pyreadstat
-from dash import Dash, dcc, html, Input, Output, State
+from dash import Dash, dcc, html, Input, Output
 import plotly.express as px
 import plotly.graph_objects as go
+import os
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Relative data paths
-EXCEL_PATH = os.path.join("data", "FIELD DAYS VARIETIES SATISFACTION RATING.xlsx")
-SAV_PATH = os.path.join("data", "FIELD DAYS VARIETIES SATISFACTION RATING.sav")
+EXCEL_PATH = "data/FIELD DAYS VARIETIES SATISFACTION RATING.xlsx"
+SAV_PATH   = "data/FIELD DAYS VARIETIES SATISFACTION RATING.sav"
 
-# Variety mapping (from your notebook)
+# Variety mapping
 variety_map = {
     1: "SC 301", 2: "SC 419", 3: "SC 423", 4: "SC 529", 5: "SC 555",
     6: "SC 653", 7: "SC 665", 8: "SC 729", 9: "SC Saga", 10: "SC Signal",
@@ -28,24 +24,18 @@ variety_map = {
 
 def map_varieties(df):
     if "VARIETY" in df.columns:
-        try:
-            df["VARIETY"] = pd.to_numeric(df["VARIETY"], errors="coerce").astype("Int64")
-        except Exception:
-            pass
+        df["VARIETY"] = pd.to_numeric(df["VARIETY"], errors="coerce").astype("Int64")
         df["VARIETY"] = df["VARIETY"].map(variety_map).fillna(df["VARIETY"])
     if "BUYING" in df.columns:
-        try:
-            df["BUYING"] = pd.to_numeric(df["BUYING"], errors="coerce").astype("Int64")
-        except Exception:
-            pass
+        df["BUYING"] = pd.to_numeric(df["BUYING"], errors="coerce").astype("Int64")
         df["BUYING"] = df["BUYING"].map(variety_map).fillna(df["BUYING"])
     return df
 
 def load_data():
-    # Prefer Excel sheet 'FIELD' then SAV, else sample
+    # Try Excel first
     if os.path.exists(EXCEL_PATH):
         try:
-            logger.info("Loading Excel: %s (sheet=FIELD)", EXCEL_PATH)
+            logger.info("Loading Excel: %s", EXCEL_PATH)
             df = pd.read_excel(EXCEL_PATH, sheet_name="FIELD", engine="openpyxl")
             df.columns = df.columns.str.strip()
             df = map_varieties(df)
@@ -57,6 +47,7 @@ def load_data():
         except Exception as e:
             logger.exception("Failed to load Excel: %s", e)
 
+    # Fallback to SAV
     if os.path.exists(SAV_PATH):
         try:
             logger.info("Loading SAV: %s", SAV_PATH)
@@ -71,7 +62,7 @@ def load_data():
         except Exception as e:
             logger.exception("Failed to load SAV: %s", e)
 
-    # Fallback sample
+    # Sample fallback
     logger.warning("No data files found; using sample fallback.")
     sample = {
         "VARIETY": ["SC 301", "SC 419", "SC 301", "SC 423"],
@@ -81,10 +72,8 @@ def load_data():
     }
     return pd.DataFrame(sample)
 
-# Global dataframe
+# Load global dataframe
 df = load_data()
-
-# Debug prints (visible in Render logs)
 logger.info("Columns present: %s", list(df.columns))
 logger.info("First 5 rows:\n%s", df.head().to_string())
 
@@ -98,6 +87,7 @@ def empty_figure():
     fig.update_layout(plot_bgcolor="#262626", paper_bgcolor="#1e1e1e", font_color="#ffffff")
     return fig
 
+# Layout
 app.layout = html.Div([
     html.H1("🌾 Variety Satisfaction Dashboard", style={"textAlign":"center","color":"#ffffff","fontFamily":"Arial Black"}),
     html.Div([
@@ -146,18 +136,17 @@ def update_dashboard(selected_district, selected_variety):
     if filtered.empty:
         return empty_fig, empty_fig, empty_fig, [], [], empty_cards
 
-    # avg rating bar
+    # Avg rating bar
     avg_rating = filtered.groupby('VARIETY', dropna=False)['RATING'].mean().reset_index()
-    bar_fig = px.bar(avg_rating, x='VARIETY', y='RATING', title="Average Rating per Variety",
-                     color='VARIETY')
+    bar_fig = px.bar(avg_rating, x='VARIETY', y='RATING', title="Average Rating per Variety", color='VARIETY')
     bar_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
 
-    # distribution
+    # Distribution
     dist_fig = px.histogram(filtered, x='RATING', color='VARIETY', barmode='overlay', nbins=5, title="Rating Distribution by Variety")
     dist_fig.update_traces(opacity=0.7)
     dist_fig.update_layout(plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
 
-    # buying counts
+    # Buying counts
     if 'BUYING' in filtered.columns:
         buying_counts = filtered['BUYING'].value_counts(dropna=False).reset_index()
         buying_counts.columns = ['VARIETY','Count']
@@ -166,8 +155,10 @@ def update_dashboard(selected_district, selected_variety):
     else:
         buy_fig = empty_fig
 
-    # cards
-    card_style = {"padding":"20px","margin":"15px","border":"2px solid #444","borderRadius":"10px","width":"220px","textAlign":"center","boxShadow":"0px 4px 15px rgba(0,0,0,0.4)","backgroundColor":"#2e2e2e","color":"#f2f2f2"}
+    # Cards
+    card_style = {"padding":"20px","margin":"15px","border":"2px solid #444","borderRadius":"10px",
+                  "width":"220px","textAlign":"center","boxShadow":"0px 4px 15px rgba(0,0,0,0.4)",
+                  "backgroundColor":"#2e2e2e","color":"#f2f2f2"}
     cards = [
         html.Div([html.H4("Total Records"), html.P(int(len(filtered)))], style=card_style),
         html.Div([html.H4("Average Rating"), html.P(round(float(filtered['RATING'].mean()),2))], style=card_style),

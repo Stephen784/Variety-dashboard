@@ -1,7 +1,6 @@
 # app.py
 import os
 import logging
-import re
 import pandas as pd
 import pyreadstat
 from dash import Dash, dcc, html, Input, Output, dash_table
@@ -23,7 +22,7 @@ EXCEL_PATH = os.path.join(DATA_DIR, "FIELD DAYS VARIETIES SATISFACTION RATING.xl
 SAV_PATH   = os.path.join(DATA_DIR, "FIELD DAYS VARIETIES SATISFACTION RATING.sav")
 
 # -------------------------
-# Exact variety mapping (the 13 you provided)
+# Exact variety mapping (13 varieties)
 # -------------------------
 variety_map = {
     1: "SC 301", 2: "SC 419", 3: "SC 423", 4: "SC 529", 5: "SC 555",
@@ -32,7 +31,7 @@ variety_map = {
 }
 
 # -------------------------
-# Rating text ↔ code maps
+# Rating text -> numeric map
 # -------------------------
 rating_text_to_code = {
     "very dissatisfied": 1,
@@ -42,10 +41,8 @@ rating_text_to_code = {
     "very satisfied": 5,
 }
 
-rating_code_to_text = {v: k.title() for k, v in rating_text_to_code.items()}
-
 # -------------------------
-# Helpers for loading + cleaning
+# Helpers
 # -------------------------
 def normalize_str(x):
     if pd.isna(x):
@@ -54,8 +51,12 @@ def normalize_str(x):
         return x.strip().lower()
     return str(x).strip().lower()
 
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.dropna(axis=1, how="all")
+    df.columns = df.columns.astype(str).str.strip()
+    return df
+
 def map_varieties(df: pd.DataFrame) -> pd.DataFrame:
-    """Map numeric codes to names but keep existing names if present."""
     if "VARIETY" in df.columns:
         numeric = pd.to_numeric(df["VARIETY"], errors="coerce")
         mapped = numeric.map(variety_map)
@@ -66,51 +67,43 @@ def map_varieties(df: pd.DataFrame) -> pd.DataFrame:
         df["BUYING"] = mapped.combine_first(df["BUYING"].astype(object))
     return df
 
-def coerce_ratings(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_rating_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Create:
-      - RATING_RAW (original)
-      - RATING_CODE (1-5 numeric if can determine)
-      - RATING_TEXT (canonical text from code if code exists)
-    Do not drop rows.
+    Replace the RATING column with numeric codes (Int64 nullable).
+    Rules:
+      1) If already numeric -> keep (coerced)
+      2) Else, map common text labels to codes
+      3) Else, extract first integer from string (e.g. '5 (Very satisfied)')
+      4) Final: coerce to Int64, filter to 1..5 (out-of-range -> NA)
     """
     if "RATING" not in df.columns:
-        df["RATING_RAW"] = pd.NA
-        df["RATING_CODE"] = pd.NA
-        df["RATING_TEXT"] = pd.NA
         return df
 
-    df["RATING_RAW"] = df["RATING"]
-
-    # 1) Try numeric conversion first
+    # 1) try numeric conversion
     codes = pd.to_numeric(df["RATING"], errors="coerce")
 
-    # 2) For non-numeric, map common text labels
+    # 2) map text labels for non-numeric entries
     mask_nonnum = codes.isna()
     if mask_nonnum.any():
         mapped = df.loc[mask_nonnum, "RATING"].map(lambda x: rating_text_to_code.get(normalize_str(x), pd.NA))
         codes.loc[mask_nonnum] = pd.to_numeric(mapped, errors="coerce")
 
-    # 3) If still NaN, try extracting first integer in string (e.g., "5 (Very satisfied)")
+    # 3) still-na: extract digits from strings like "5 (Very satisfied)"
     mask_still_na = codes.isna()
     if mask_still_na.any():
         extracted = df.loc[mask_still_na, "RATING"].astype(str).str.extract(r"(\d+)", expand=False)
         codes.loc[mask_still_na] = pd.to_numeric(extracted, errors="coerce")
 
-    # Keep codes as floats (NaN for unknown); that's fine for grouping/mean calculations
-    df["RATING_CODE"] = codes
+    # 4) enforce range 1..5, else set to NA
+    codes = codes.where(codes.between(1, 5), other=pd.NA)
 
-    # Create canonical text from code when available; else keep original text (title-cased)
-    df["RATING_TEXT"] = df["RATING_CODE"].map(lambda v: rating_code_to_text.get(int(v), pd.NA) if pd.notna(v) else pd.NA)
-    # If RATING_TEXT is NA, fill with original (cleaned)
-    df["RATING_TEXT"] = df["RATING_TEXT"].fillna(df["RATING_RAW"].astype(str))
+    # convert to nullable Int64 (keeps NA if present)
+    try:
+        df["RATING"] = codes.astype("Int64")
+    except Exception:
+        # fallback: keep as numeric float with NaNs if Int64 conversion fails
+        df["RATING"] = pd.to_numeric(codes, errors="coerce")
 
-    return df
-
-def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # drop fully empty columns and normalize whitespace in column names
-    df = df.dropna(axis=1, how="all")
-    df.columns = df.columns.astype(str).str.strip()
     return df
 
 def _detect_header_and_read(path):
@@ -118,32 +111,26 @@ def _detect_header_and_read(path):
     try:
         xls = pd.ExcelFile(path, engine="openpyxl")
     except Exception as e:
+        logger.exception("ExcelFile open failed: %s", e)
         raise
 
-    # prefer FIELD sheet if present
     sheet_order = (["FIELD"] if "FIELD" in xls.sheet_names else []) + [s for s in xls.sheet_names if s != "FIELD"]
 
-    # try header=0
+    # Try header=0 first
     for s in sheet_order:
         try:
             tmp = pd.read_excel(path, sheet_name=s, engine="openpyxl", header=0)
             tmp = _clean_columns(tmp)
             if not tmp.dropna(how="all").empty:
-                # if we have at least one column that looks like 'VARIETY' or 'RATING', accept
-                cols = [c.strip().upper() for c in tmp.columns]
-                if any("VARIETY" in c.upper() for c in tmp.columns) or any("RATING" in c.upper() for c in tmp.columns):
-                    logger.info("Read sheet '%s' with header=0 (shape=%s)", s, tmp.shape)
-                    return tmp
-                # else still accept because user wants all rows, we'll fallback to broader detection if needed
+                logger.info("Read sheet '%s' with header=0 (shape=%s)", s, tmp.shape)
                 return tmp
         except Exception:
             continue
 
-    # fallback: read header=None and detect the header row
+    # Fallback: header=None and detect header row
     for s in sheet_order:
         try:
             raw = pd.read_excel(path, sheet_name=s, engine="openpyxl", header=None)
-            # scan first 15 rows for a header-like row
             max_scan = min(15, len(raw))
             for idx in range(max_scan):
                 rowvals = raw.iloc[idx].astype(str).str.strip().str.upper().tolist()
@@ -157,51 +144,53 @@ def _detect_header_and_read(path):
         except Exception:
             continue
 
-    # if nothing worked, try first sheet header=0 to at least get something
+    # Last-resort: first sheet header=0
     try:
         tmp = pd.read_excel(path, sheet_name=0, engine="openpyxl", header=0)
         tmp = _clean_columns(tmp)
         logger.info("Fallback read first sheet header=0 (shape=%s)", tmp.shape)
         return tmp
     except Exception:
-        # final fallback
         return pd.DataFrame()
 
 def load_data() -> pd.DataFrame:
-    # Prefer Excel
+    # 1) Excel
     if os.path.exists(EXCEL_PATH):
         try:
             logger.info("Loading Excel: %s", EXCEL_PATH)
             df = _detect_header_and_read(EXCEL_PATH)
             if df is not None and not df.empty:
                 df = map_varieties(df)
-                df = coerce_ratings(df)
+                df = normalize_rating_column(df)   # <--- overwrite RATING with numeric codes here
                 logger.info("Excel loaded, final shape=%s", df.shape)
                 return df
             else:
-                logger.warning("Excel read returned empty dataframe; falling back to SAV")
+                logger.warning("Excel read returned empty; falling back to SAV.")
         except Exception as e:
             logger.exception("Excel load failed: %s", e)
 
-    # Try SAV
+    # 2) SAV fallback
     if os.path.exists(SAV_PATH):
         try:
             logger.info("Loading SAV: %s", SAV_PATH)
             df, _meta = pyreadstat.read_sav(SAV_PATH)
             df = _clean_columns(df)
             df = map_varieties(df)
-            # For SAV, RATING likely numeric codes already
+            # For SAV most likely RATING is already numeric codes -> ensure Int64
             if "RATING" in df.columns:
-                df["RATING_CODE"] = pd.to_numeric(df["RATING"], errors="coerce")
-                df["RATING_TEXT"] = df["RATING_CODE"].map(lambda v: rating_code_to_text.get(int(v), pd.NA) if pd.notna(v) else pd.NA)
+                df["RATING"] = pd.to_numeric(df["RATING"], errors="coerce").where(lambda s: s.between(1,5), other=pd.NA)
+                try:
+                    df["RATING"] = df["RATING"].astype("Int64")
+                except Exception:
+                    df["RATING"] = pd.to_numeric(df["RATING"], errors="coerce")
             else:
-                df = coerce_ratings(df)
-            logger.info("SAV loaded, shape=%s", df.shape)
+                df = normalize_rating_column(df)
+            logger.info("SAV loaded, final shape=%s", df.shape)
             return df
         except Exception as e:
             logger.exception("SAV load failed: %s", e)
 
-    # Final fallback (tiny sample so the app boots)
+    # 3) Sample fallback
     logger.warning("No data files found; using sample fallback.")
     sample = pd.DataFrame({
         "VARIETY": ["SC 301", "SC 419", "SC 301", "SC 423"],
@@ -210,16 +199,16 @@ def load_data() -> pd.DataFrame:
         "DISTRICT": ["D1", "D2", "D1", "D3"],
     })
     sample = map_varieties(sample)
-    sample = coerce_ratings(sample)
+    sample = normalize_rating_column(sample)
     return sample
 
-# Load once
+# Load dataframe once at boot
 df = load_data()
 logger.info("Columns present: %s", list(df.columns))
-logger.info("First 5 rows:\n%s", df.head(8).to_string())
+logger.info("First 8 rows:\n%s", df.head(8).to_string())
 
 # -------------------------
-# Dash app
+# Dash App
 # -------------------------
 app = Dash(__name__)
 server = app.server
@@ -240,7 +229,7 @@ app.layout = html.Div([
         ], style={"width":"45%","display":"inline-block","padding":"10px"}),
         html.Div([
             html.Label("Select Variety:", style={"fontWeight":"bold","color":"#ffffff"}),
-            dcc.Dropdown(id="variety-dropdown", options=[], placeholder="Select Variety", clearable=True)
+            dcc.Dropdown(id="variety-dropdown", options=[], placeholder="All Varieties", clearable=True)
         ], style={"width":"45%","display":"inline-block","padding":"10px"})
     ], style={"marginTop":"20px","textAlign":"center"}),
     html.Br(),
@@ -290,17 +279,17 @@ def update_dashboard(selected_district, selected_variety):
     if selected_variety and 'VARIETY' in filtered.columns:
         filtered = filtered[filtered['VARIETY'] == selected_variety]
 
-    # Bar: average by variety (use numeric codes)
-    if 'VARIETY' in filtered.columns and 'RATING_CODE' in filtered.columns and not filtered['RATING_CODE'].dropna().empty:
-        avg_rating = filtered.groupby('VARIETY', dropna=False)['RATING_CODE'].mean().reset_index()
-        bar_fig = px.bar(avg_rating, x='VARIETY', y='RATING_CODE', title="Average Rating per Variety", color='VARIETY')
+    # Average rating per variety (uses numeric RATING)
+    if 'VARIETY' in filtered.columns and 'RATING' in filtered.columns and not filtered['RATING'].dropna().empty:
+        avg_rating = filtered.groupby('VARIETY', dropna=False)['RATING'].mean().reset_index()
+        bar_fig = px.bar(avg_rating, x='VARIETY', y='RATING', title="Average Rating per Variety", color='VARIETY')
         bar_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
     else:
         bar_fig = empty_fig
 
     # Distribution: numeric rating distribution
-    if 'RATING_CODE' in filtered.columns and not filtered['RATING_CODE'].dropna().empty:
-        dist_fig = px.histogram(filtered, x='RATING_CODE', nbins=5, title="Rating Distribution (codes 1-5)")
+    if 'RATING' in filtered.columns and not filtered['RATING'].dropna().empty:
+        dist_fig = px.histogram(filtered, x='RATING', nbins=5, title="Rating Distribution (codes 1-5)")
         dist_fig.update_traces(opacity=0.85)
         dist_fig.update_layout(xaxis_title="Rating (1–5)", yaxis_title="Count", plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
     else:
@@ -317,7 +306,7 @@ def update_dashboard(selected_district, selected_variety):
 
     # Cards
     total_records = int(len(filtered))
-    avg_rating_val = (round(float(filtered['RATING_CODE'].mean()), 2) if 'RATING_CODE' in filtered.columns and not filtered['RATING_CODE'].dropna().empty else "—")
+    avg_rating_val = (round(float(filtered['RATING'].mean()), 2) if 'RATING' in filtered.columns and not filtered['RATING'].dropna().empty else "—")
     unique_varieties = int(filtered['VARIETY'].nunique(dropna=True)) if 'VARIETY' in filtered.columns else "—"
 
     card_style = {"padding":"20px","margin":"15px","border":"2px solid #444","borderRadius":"10px","width":"220px","textAlign":"center","boxShadow":"0px 4px 15px rgba(0,0,0,0.4)","backgroundColor":"#2e2e2e","color":"#f2f2f2"}
@@ -330,7 +319,7 @@ def update_dashboard(selected_district, selected_variety):
     district_options = [{"label": d, "value": d} for d in sorted(df['DISTRICT'].dropna().unique())] if 'DISTRICT' in df.columns else []
     variety_options  = [{"label": v, "value": v} for v in sorted(df['VARIETY'].dropna().unique())] if 'VARIETY' in df.columns else []
 
-    # Raw table
+    # Raw table data/columns
     table_cols = [{"name": c, "id": c} for c in filtered.columns]
     table_data = filtered.to_dict("records")
 

@@ -40,14 +40,12 @@ ALLOWED_VARIETIES = [
 ]
 ALLOWED_VARIETIES_SET = set(ALLOWED_VARIETIES)
 
-# Build a normalized-key -> canonical mapping for aggressive matching
+# Normalization helper for aggressive matching
 def _normalize_key_for_match(s: str) -> str:
-    # Lowercase, strip, collapse whitespace, remove punctuation except hyphen and digits/letters
     if s is None:
         return ""
     s = str(s).strip().lower()
     s = re.sub(r"\s+", " ", s)
-    # keep letters, digits and hyphen only
     s = re.sub(r"[^a-z0-9\-]", "", s)
     return s
 
@@ -85,7 +83,6 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def map_varieties(df: pd.DataFrame) -> pd.DataFrame:
-    # Map numeric codes to names; keep existing names if already present
     if "VARIETY" in df.columns:
         numeric = pd.to_numeric(df["VARIETY"], errors="coerce")
         mapped = numeric.map(variety_map)
@@ -97,8 +94,6 @@ def map_varieties(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def canonicalize_varieties_and_buying_aggressive(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggressively canonicalize VARIETY and BUYING using NORMALIZED_ALLOWED mapping.
-       This maps case/spacing/punctuation differences to canonical allowed names."""
     for col in ("VARIETY", "BUYING"):
         if col in df.columns:
             def _canon(val):
@@ -107,38 +102,32 @@ def canonicalize_varieties_and_buying_aggressive(df: pd.DataFrame) -> pd.DataFra
                 key = _normalize_key_for_match(val)
                 if key in NORMALIZED_ALLOWED:
                     return NORMALIZED_ALLOWED[key]
-                # also try simple contains match (e.g. "sc301" vs "sc301extra") - only if unique
                 for nk, canon in NORMALIZED_ALLOWED.items():
                     if nk and nk in key:
                         return canon
-                return val  # leave as-is if no match
+                return val
             df[col] = df[col].apply(lambda x: _canon(x) if pd.notna(x) else None)
     return df
 
 def normalize_rating_column_inplace(df: pd.DataFrame) -> pd.DataFrame:
-    """Replace RATING column in-place with numeric codes (Int64 if possible)."""
     if "RATING" not in df.columns:
         return df
-
     codes = pd.to_numeric(df["RATING"], errors="coerce")
-
     mask_nonnum = codes.isna()
     if mask_nonnum.any():
-        mapped = df.loc[mask_nonnum, "RATING"].map(lambda x: rating_text_to_code.get(re.sub(r"\s+","",str(x).strip().lower()), pd.NA))
+        mapped = df.loc[mask_nonnum, "RATING"].map(
+            lambda x: rating_text_to_code.get(re.sub(r"\s+","",str(x).strip().lower()), pd.NA)
+        )
         codes.loc[mask_nonnum] = pd.to_numeric(mapped, errors="coerce")
-
     mask_still_na = codes.isna()
     if mask_still_na.any():
         extracted = df.loc[mask_still_na, "RATING"].astype(str).str.extract(r"(\d+)", expand=False)
         codes.loc[mask_still_na] = pd.to_numeric(extracted, errors="coerce")
-
     codes = codes.where(codes.between(1, 5), other=pd.NA)
-
     try:
         df["RATING"] = codes.astype("Int64")
     except Exception:
         df["RATING"] = pd.to_numeric(codes, errors="coerce")
-
     return df
 
 def normalize_text_columns_to_str(df: pd.DataFrame, cols):
@@ -148,7 +137,6 @@ def normalize_text_columns_to_str(df: pd.DataFrame, cols):
     return df
 
 def get_dropdown_options_sorted(df: pd.DataFrame, col: str):
-    """Robust sort: numeric-like values sorted numerically (as strings), then text sorted alpha."""
     if col not in df.columns:
         return []
     vals = df[col].dropna().unique().tolist()
@@ -166,11 +154,10 @@ def get_dropdown_options_sorted(df: pd.DataFrame, col: str):
     return [{"label": v, "value": v} for v in ordered]
 
 def get_allowed_variety_options_always_show_all(df: pd.DataFrame):
-    """Always return all 13 allowed varieties in canonical order (so dropdown lists all 13)."""
     return [{"label": v, "value": v} for v in ALLOWED_VARIETIES]
 
 # -------------------------
-# Excel header detection & read (robust)
+# Excel read helpers
 # -------------------------
 def _detect_header_and_read(path):
     try:
@@ -178,10 +165,7 @@ def _detect_header_and_read(path):
     except Exception as e:
         logger.exception("ExcelFile open failed: %s", e)
         raise
-
     sheet_order = (["FIELD"] if "FIELD" in xls.sheet_names else []) + [s for s in xls.sheet_names if s != "FIELD"]
-
-    # Try header=0 first
     for s in sheet_order:
         try:
             tmp = pd.read_excel(path, sheet_name=s, engine="openpyxl", header=0)
@@ -191,8 +175,6 @@ def _detect_header_and_read(path):
                 return tmp
         except Exception:
             continue
-
-    # fallback: try to detect header row in first 15 rows
     for s in sheet_order:
         try:
             raw = pd.read_excel(path, sheet_name=s, engine="openpyxl", header=None)
@@ -208,8 +190,6 @@ def _detect_header_and_read(path):
                     return df
         except Exception:
             continue
-
-    # final fallback
     try:
         tmp = pd.read_excel(path, sheet_name=0, engine="openpyxl", header=0)
         tmp = _clean_columns(tmp)
@@ -219,7 +199,7 @@ def _detect_header_and_read(path):
         return pd.DataFrame()
 
 # -------------------------
-# Load data once at boot (Excel preferred, then SAV)
+# Load data
 # -------------------------
 def load_data():
     if os.path.exists(EXCEL_PATH):
@@ -228,7 +208,6 @@ def load_data():
             df_local = _detect_header_and_read(EXCEL_PATH)
             if df_local is not None and not df_local.empty:
                 df_local = map_varieties(df_local)
-                # aggressive canonicalization
                 df_local = canonicalize_varieties_and_buying_aggressive(df_local)
                 df_local = normalize_rating_column_inplace(df_local)
                 df_local = normalize_text_columns_to_str(df_local, ["VARIETY", "BUYING", "DISTRICT"])
@@ -238,7 +217,6 @@ def load_data():
                 logger.warning("Excel read returned empty; falling back to SAV.")
         except Exception as e:
             logger.exception("Excel load failed: %s", e)
-
     if os.path.exists(SAV_PATH):
         try:
             logger.info("Loading SAV: %s", SAV_PATH)
@@ -259,7 +237,6 @@ def load_data():
             return df_sav
         except Exception as e:
             logger.exception("SAV load failed: %s", e)
-
     logger.warning("No data files found; using sample fallback.")
     sample = pd.DataFrame({
         "VARIETY": ["SC 301", "SC 419", "SC 301", "SC 423"],
@@ -392,7 +369,7 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         bar_fig, dist_fig, buy_fig = empty_fig, empty_fig, empty_fig
         cards = empty_cards
     else:
-        # Average rating per variety: include only allowed varieties (preserve order)
+        # Average rating per variety: include only allowed varieties and rotate labels
         avg_df = filtered_df[filtered_df['VARIETY'].isin(ALLOWED_VARIETIES)]
         if 'VARIETY' in avg_df.columns and 'RATING' in avg_df.columns and not avg_df['RATING'].dropna().empty:
             avg_rating = avg_df.groupby('VARIETY', dropna=False)['RATING'].mean().reindex(ALLOWED_VARIETIES).reset_index()
@@ -401,7 +378,8 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
                              title="Average Rating per Variety",
                              color='VARIETY', labels={'RATING': 'Average Rating'},
                              color_discrete_sequence=px.colors.sequential.Darkmint)
-            bar_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
+            bar_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff',
+                                  xaxis_tickangle=-45)
         else:
             bar_fig = empty_fig
 
@@ -417,7 +395,7 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         else:
             dist_fig = empty_fig
 
-        # Buying counts: only allowed varieties (exclude None / unknown)
+        # Buying counts: only allowed varieties (exclude None / unknown). Sort descending.
         if 'BUYING' in filtered_df.columns:
             buy_series = filtered_df['BUYING'].dropna().astype(str)
             buy_series = buy_series[buy_series.isin(ALLOWED_VARIETIES)]
@@ -425,24 +403,29 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
                 buying_counts = buy_series.value_counts().reindex(ALLOWED_VARIETIES).fillna(0).reset_index()
                 buying_counts.columns = ['VARIETY', 'Count']
                 buying_counts = buying_counts[buying_counts['Count'] > 0]
+                # sort descending (most wanted -> least wanted)
+                buying_counts = buying_counts.sort_values('Count', ascending=False)
+                order = buying_counts['VARIETY'].tolist()
                 buy_fig = px.bar(buying_counts, x='VARIETY', y='Count', title="Willingness to Buy by Variety",
-                                 color='VARIETY', color_discrete_sequence=px.colors.sequential.Magma_r)
-                buy_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
+                                 color='VARIETY', category_orders={'VARIETY': order},
+                                 color_discrete_sequence=px.colors.sequential.Magma_r)
+                buy_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff',
+                                      xaxis_tickangle=-45)
             else:
                 buy_fig = empty_fig
         else:
             buy_fig = empty_fig
 
-        # summary cards - present_count / 13
+        # summary cards - Unique Varieties label exactly and show just 13
         card_style = {"padding":"20px","margin":"15px","border":"2px solid #444","borderRadius":"10px","width":"220px","textAlign":"center","boxShadow":"0px 4px 15px rgba(0,0,0,0.4)","backgroundColor":"#2e2e2e","color":"#f2f2f2"}
         total_records = int(len(filtered_df))
         avg_rating_val = (round(float(filtered_df['RATING'].mean()), 2) if 'RATING' in filtered_df.columns and not filtered_df['RATING'].dropna().empty else "—")
-        present_allowed = set([v for v in filtered_df.get('VARIETY', pd.Series([], dtype=object)).dropna().unique()]) & ALLOWED_VARIETIES_SET
-        present_count = len(present_allowed)
+        # display just the number 13 as requested
+        unique_varieties_display = len(ALLOWED_VARIETIES)
         cards = [
             html.Div([html.H4("Total Records"), html.P(total_records)], style=card_style),
             html.Div([html.H4("Average Rating"), html.P(avg_rating_val)], style=card_style),
-            html.Div([html.H4("Unique Varieties (present/total)"), html.P(f"{present_count} / {len(ALLOWED_VARIETIES)}")], style=card_style)
+            html.Div([html.H4("Unique Varieties"), html.P(unique_varieties_display)], style=card_style)
         ]
 
     district_options = get_dropdown_options_sorted(df, 'DISTRICT') if 'DISTRICT' in df.columns else []

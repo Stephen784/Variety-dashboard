@@ -1,0 +1,38 @@
+/* ===========================
+   DASH DROPDOWN CUSTOM STYLES
+   =========================== */
+
+/* Dropdown container */
+.Select-control {
+    background-color: #1E1E1E !important; /* dark background */
+    border: 1px solid #00BFFF !important; /* blue border */
+    color: #00BFFF !important; /* blue text */
+}
+
+/* Dropdown menu background */
+.Select-menu-outer {
+    background-color: #1E1E1E !important; /* dark */
+    border: 1px solid #00BFFF !important; /* blue border */
+}
+
+/* Options inside dropdown */
+.Select-option {
+    background-color: #1E1E1E !important; /* dark */
+    color: #FFFFFF !important; /* white text */
+}
+
+/* Hover effect on options */
+.Select-option.is-focused {
+    background-color: #333333 !important; /* slightly lighter dark */
+    color: #00BFFF !important; /* blue on hover */
+}
+
+/* Selected value text */
+.Select-value-label {
+    color: #00BFFF !important; /* blue selected text */
+}
+
+/* Search input inside dropdown */
+.Select-input > input {
+    color: #00BFFF !important;
+}

@@ -1,8 +1,8 @@
 # app.py
 import os
+import re
 import logging
 import base64
-import io
 
 import pandas as pd
 import pyreadstat
@@ -26,7 +26,7 @@ EXCEL_PATH = os.path.join(DATA_DIR, "FIELD DAYS VARIETIES SATISFACTION RATING.xl
 SAV_PATH = os.path.join(DATA_DIR, "FIELD DAYS VARIETIES SATISFACTION RATING.sav")
 
 # -------------------------
-# Exact 13-variety mapping
+# Exact 13-variety mapping (canonical)
 # -------------------------
 variety_map = {
     1: "SC 301", 2: "SC 419", 3: "SC 423", 4: "SC 529", 5: "SC 555",
@@ -39,18 +39,29 @@ ALLOWED_VARIETIES = [
     "SC Serenade","Nerica-4","Sorghum"
 ]
 ALLOWED_VARIETIES_SET = set(ALLOWED_VARIETIES)
-# map normalized( lower, stripped ) -> canonical label
-NORMALIZED_ALLOWED = {v.strip().lower(): v for v in ALLOWED_VARIETIES}
+
+# Build a normalized-key -> canonical mapping for aggressive matching
+def _normalize_key_for_match(s: str) -> str:
+    # Lowercase, strip, collapse whitespace, remove punctuation except hyphen and digits/letters
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    # keep letters, digits and hyphen only
+    s = re.sub(r"[^a-z0-9\-]", "", s)
+    return s
+
+NORMALIZED_ALLOWED = { _normalize_key_for_match(v): v for v in ALLOWED_VARIETIES }
 
 # -------------------------
 # Rating mapping (text -> code)
 # -------------------------
 rating_text_to_code = {
-    "very dissatisfied": 1,
+    "verydissatisfied": 1,
     "dissatisfied": 2,
     "neutral": 3,
     "satisfied": 4,
-    "very satisfied": 5,
+    "verysatisfied": 5,
 }
 
 # -------------------------
@@ -85,16 +96,22 @@ def map_varieties(df: pd.DataFrame) -> pd.DataFrame:
         df["BUYING"] = mapped.combine_first(df["BUYING"].astype(object))
     return df
 
-def canonicalize_varieties_and_buying(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert any VARIETY/BUYING text that matches (case/space-insensitive) an allowed variety
-       into the canonical allowed label. This fixes counts when data has capitalization/spaces."""
+def canonicalize_varieties_and_buying_aggressive(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggressively canonicalize VARIETY and BUYING using NORMALIZED_ALLOWED mapping.
+       This maps case/spacing/punctuation differences to canonical allowed names."""
     for col in ("VARIETY", "BUYING"):
         if col in df.columns:
             def _canon(val):
                 if pd.isna(val):
                     return None
-                s = str(val).strip().lower()
-                return NORMALIZED_ALLOWED.get(s, val)  # keep original if not matched
+                key = _normalize_key_for_match(val)
+                if key in NORMALIZED_ALLOWED:
+                    return NORMALIZED_ALLOWED[key]
+                # also try simple contains match (e.g. "sc301" vs "sc301extra") - only if unique
+                for nk, canon in NORMALIZED_ALLOWED.items():
+                    if nk and nk in key:
+                        return canon
+                return val  # leave as-is if no match
             df[col] = df[col].apply(lambda x: _canon(x) if pd.notna(x) else None)
     return df
 
@@ -103,25 +120,20 @@ def normalize_rating_column_inplace(df: pd.DataFrame) -> pd.DataFrame:
     if "RATING" not in df.columns:
         return df
 
-    # 1) try numeric conversion
     codes = pd.to_numeric(df["RATING"], errors="coerce")
 
-    # 2) map text labels for non-numeric entries
     mask_nonnum = codes.isna()
     if mask_nonnum.any():
-        mapped = df.loc[mask_nonnum, "RATING"].map(lambda x: rating_text_to_code.get(normalize_for_matching(x), pd.NA))
+        mapped = df.loc[mask_nonnum, "RATING"].map(lambda x: rating_text_to_code.get(re.sub(r"\s+","",str(x).strip().lower()), pd.NA))
         codes.loc[mask_nonnum] = pd.to_numeric(mapped, errors="coerce")
 
-    # 3) extract digits from strings like "5 (Very satisfied)"
     mask_still_na = codes.isna()
     if mask_still_na.any():
         extracted = df.loc[mask_still_na, "RATING"].astype(str).str.extract(r"(\d+)", expand=False)
         codes.loc[mask_still_na] = pd.to_numeric(extracted, errors="coerce")
 
-    # 4) enforce range 1..5 (out-of-range -> NA)
     codes = codes.where(codes.between(1, 5), other=pd.NA)
 
-    # 5) convert to nullable Int64 if possible
     try:
         df["RATING"] = codes.astype("Int64")
     except Exception:
@@ -153,11 +165,9 @@ def get_dropdown_options_sorted(df: pd.DataFrame, col: str):
     ordered = nums_sorted + strs_sorted
     return [{"label": v, "value": v} for v in ordered]
 
-def get_allowed_variety_options(df: pd.DataFrame):
-    # Keep only allowed varieties and preserve ALLOWED_VARIETIES order
-    present = set([str(v) for v in df.get("VARIETY", pd.Series([], dtype=object)).dropna().unique()])
-    options = [{"label": v, "value": v} for v in ALLOWED_VARIETIES if v in present]
-    return options
+def get_allowed_variety_options_always_show_all(df: pd.DataFrame):
+    """Always return all 13 allowed varieties in canonical order (so dropdown lists all 13)."""
+    return [{"label": v, "value": v} for v in ALLOWED_VARIETIES]
 
 # -------------------------
 # Excel header detection & read (robust)
@@ -212,15 +222,14 @@ def _detect_header_and_read(path):
 # Load data once at boot (Excel preferred, then SAV)
 # -------------------------
 def load_data():
-    # Excel first
     if os.path.exists(EXCEL_PATH):
         try:
             logger.info("Loading Excel: %s", EXCEL_PATH)
             df_local = _detect_header_and_read(EXCEL_PATH)
             if df_local is not None and not df_local.empty:
                 df_local = map_varieties(df_local)
-                # canonicalize textual names to allowed set if possible
-                df_local = canonicalize_varieties_and_buying(df_local)
+                # aggressive canonicalization
+                df_local = canonicalize_varieties_and_buying_aggressive(df_local)
                 df_local = normalize_rating_column_inplace(df_local)
                 df_local = normalize_text_columns_to_str(df_local, ["VARIETY", "BUYING", "DISTRICT"])
                 logger.info("Excel loaded, final shape=%s", df_local.shape)
@@ -230,14 +239,13 @@ def load_data():
         except Exception as e:
             logger.exception("Excel load failed: %s", e)
 
-    # SAV fallback
     if os.path.exists(SAV_PATH):
         try:
             logger.info("Loading SAV: %s", SAV_PATH)
             df_sav, _meta = pyreadstat.read_sav(SAV_PATH)
             df_sav = _clean_columns(df_sav)
             df_sav = map_varieties(df_sav)
-            df_sav = canonicalize_varieties_and_buying(df_sav)
+            df_sav = canonicalize_varieties_and_buying_aggressive(df_sav)
             if "RATING" in df_sav.columns:
                 df_sav["RATING"] = pd.to_numeric(df_sav["RATING"], errors="coerce").where(lambda s: s.between(1,5), other=pd.NA)
                 try:
@@ -252,7 +260,6 @@ def load_data():
         except Exception as e:
             logger.exception("SAV load failed: %s", e)
 
-    # fallback sample so app still boots
     logger.warning("No data files found; using sample fallback.")
     sample = pd.DataFrame({
         "VARIETY": ["SC 301", "SC 419", "SC 301", "SC 423"],
@@ -261,14 +268,14 @@ def load_data():
         "DISTRICT": ["D1", "D2", "D1", "D3"]
     })
     sample = map_varieties(sample)
-    sample = canonicalize_varieties_and_buying(sample)
+    sample = canonicalize_varieties_and_buying_aggressive(sample)
     sample = normalize_rating_column_inplace(sample)
     sample = normalize_text_columns_to_str(sample, ["VARIETY", "BUYING", "DISTRICT"])
     return sample
 
 df = load_data()
 logger.info("Columns present: %s", list(df.columns))
-logger.info("First 12 rows:\n%s", df.head(12).to_string())
+logger.info("Variants present (sample): %s", sorted([str(v) for v in df.get("VARIETY", pd.Series([], dtype=object)).dropna().unique()])[:50])
 
 # -------------------------
 # Dash app & layout
@@ -309,7 +316,7 @@ app.layout = html.Div([
             html.Label("Select Variety:", style={"fontWeight": "bold", "color": "#ffffff"}),
             dcc.Dropdown(
                 id='variety-dropdown',
-                options=[],
+                options=get_allowed_variety_options_always_show_all(df),
                 placeholder="Select Variety",
                 clearable=True,
                 style={'backgroundColor': '#1E1E1E', 'color': '#00BFFF', 'border': '1px solid #00BFFF'}
@@ -350,12 +357,10 @@ app.layout = html.Div([
 def update_dashboard(contents, selected_district, selected_variety, filename):
     global df
 
-    # base empty figure
     empty_fig = go.Figure()
     empty_fig.update_layout(plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
     empty_cards = []
 
-    # handle uploaded SAV - replace df in-memory for the session
     if contents:
         try:
             content_type, content_string = contents.split(',', 1)
@@ -366,31 +371,28 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
             df_new, _ = pyreadstat.read_sav(tmp_path)
             df_new = _clean_columns(df_new)
             df_new = map_varieties(df_new)
-            df_new = canonicalize_varieties_and_buying(df_new)
+            df_new = canonicalize_varieties_and_buying_aggressive(df_new)
             df_new = normalize_rating_column_inplace(df_new)
             df_new = normalize_text_columns_to_str(df_new, ["VARIETY", "BUYING", "DISTRICT"])
             df = df_new
         except Exception as e:
             err = html.Div(f"Upload error: {e}", style={"color": "#ff6b6b"})
-            return empty_fig, empty_fig, empty_fig, [], [], [err]
+            return empty_fig, empty_fig, empty_fig, [], get_allowed_variety_options_always_show_all(df), [err]
 
-    # if no data -> return placeholders
     if df is None or df.empty:
-        return empty_fig, empty_fig, empty_fig, [], [], empty_cards
+        return empty_fig, empty_fig, empty_fig, [], get_allowed_variety_options_always_show_all(df), empty_cards
 
-    # Filtering: selected values are strings; compare normalized
     filtered_df = df.copy()
     if selected_district and 'DISTRICT' in filtered_df.columns:
         filtered_df = filtered_df[filtered_df['DISTRICT'].apply(lambda x: normalize_for_matching(x) == normalize_for_matching(selected_district))]
     if selected_variety and 'VARIETY' in filtered_df.columns:
         filtered_df = filtered_df[filtered_df['VARIETY'].apply(lambda x: normalize_for_matching(x) == normalize_for_matching(selected_variety))]
 
-    # Charts
     if filtered_df.empty:
         bar_fig, dist_fig, buy_fig = empty_fig, empty_fig, empty_fig
         cards = empty_cards
     else:
-        # Average rating per variety: only allowed canonical varieties included, preserve ALLOWED order
+        # Average rating per variety: include only allowed varieties (preserve order)
         avg_df = filtered_df[filtered_df['VARIETY'].isin(ALLOWED_VARIETIES)]
         if 'VARIETY' in avg_df.columns and 'RATING' in avg_df.columns and not avg_df['RATING'].dropna().empty:
             avg_rating = avg_df.groupby('VARIETY', dropna=False)['RATING'].mean().reindex(ALLOWED_VARIETIES).reset_index()
@@ -403,7 +405,7 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         else:
             bar_fig = empty_fig
 
-        # Distribution by numeric RATING - color by allowed variety (others won't show as colors)
+        # Distribution by numeric RATING
         if 'RATING' in filtered_df.columns and not filtered_df['RATING'].dropna().empty:
             plot_df = filtered_df.copy()
             plot_df['VARIETY_PLOT'] = plot_df['VARIETY'].where(plot_df['VARIETY'].isin(ALLOWED_VARIETIES), other=None)
@@ -415,7 +417,7 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         else:
             dist_fig = empty_fig
 
-        # Buying counts: only allowed varieties, exclude None and unknowns
+        # Buying counts: only allowed varieties (exclude None / unknown)
         if 'BUYING' in filtered_df.columns:
             buy_series = filtered_df['BUYING'].dropna().astype(str)
             buy_series = buy_series[buy_series.isin(ALLOWED_VARIETIES)]
@@ -431,25 +433,20 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         else:
             buy_fig = empty_fig
 
-        # summary cards - Unique varieties counts only allowed canonical ones
-        card_style = {
-            "padding": "20px", "margin": "15px", "border": "2px solid #444",
-            "borderRadius": "10px", "width": "220px", "textAlign": "center",
-            "boxShadow": "0px 4px 15px rgba(0,0,0,0.4)", "backgroundColor": "#2e2e2e", "color": "#f2f2f2"
-        }
+        # summary cards - present_count / 13
+        card_style = {"padding":"20px","margin":"15px","border":"2px solid #444","borderRadius":"10px","width":"220px","textAlign":"center","boxShadow":"0px 4px 15px rgba(0,0,0,0.4)","backgroundColor":"#2e2e2e","color":"#f2f2f2"}
         total_records = int(len(filtered_df))
         avg_rating_val = (round(float(filtered_df['RATING'].mean()), 2) if 'RATING' in filtered_df.columns and not filtered_df['RATING'].dropna().empty else "—")
         present_allowed = set([v for v in filtered_df.get('VARIETY', pd.Series([], dtype=object)).dropna().unique()]) & ALLOWED_VARIETIES_SET
-        unique_varieties = len(present_allowed)
-
+        present_count = len(present_allowed)
         cards = [
             html.Div([html.H4("Total Records"), html.P(total_records)], style=card_style),
             html.Div([html.H4("Average Rating"), html.P(avg_rating_val)], style=card_style),
-            html.Div([html.H4("Unique Varieties"), html.P(unique_varieties)], style=card_style)
+            html.Div([html.H4("Unique Varieties (present/total)"), html.P(f"{present_count} / {len(ALLOWED_VARIETIES)}")], style=card_style)
         ]
 
     district_options = get_dropdown_options_sorted(df, 'DISTRICT') if 'DISTRICT' in df.columns else []
-    variety_options = get_allowed_variety_options(df)
+    variety_options = get_allowed_variety_options_always_show_all(df)
 
     return bar_fig, dist_fig, buy_fig, district_options, variety_options, cards
 

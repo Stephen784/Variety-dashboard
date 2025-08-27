@@ -38,6 +38,7 @@ ALLOWED_VARIETIES = [
     "SC 653","SC 665","SC 729","SC Saga","SC Signal",
     "SC Serenade","Nerica-4","Sorghum"
 ]
+ALLOWED_VARIETIES_SET = set(ALLOWED_VARIETIES)
 
 # -------------------------
 # Rating mapping (text -> code)
@@ -138,6 +139,7 @@ def get_dropdown_options_sorted(df: pd.DataFrame, col: str):
     return [{"label": v, "value": v} for v in ordered]
 
 def get_allowed_variety_options(df: pd.DataFrame):
+    # Keep only allowed varieties and preserve ALLOWED_VARIETIES order
     present = set([str(v) for v in df.get("VARIETY", pd.Series([], dtype=object)).dropna().unique()])
     options = [{"label": v, "value": v} for v in ALLOWED_VARIETIES if v in present]
     return options
@@ -368,9 +370,14 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         bar_fig, dist_fig, buy_fig = empty_fig, empty_fig, empty_fig
         cards = empty_cards
     else:
-        # Average rating per variety (use numeric RATING)
-        if 'VARIETY' in filtered_df.columns and 'RATING' in filtered_df.columns and not filtered_df['RATING'].dropna().empty:
-            avg_rating = filtered_df.groupby('VARIETY', dropna=False)['RATING'].mean().reset_index()
+        # Filter to allowed varieties for visuals where appropriate
+        # For average rating per variety: only include allowed varieties
+        avg_df = filtered_df.copy()
+        avg_df = avg_df[avg_df['VARIETY'].isin(ALLOWED_VARIETIES)]
+        if 'VARIETY' in avg_df.columns and 'RATING' in avg_df.columns and not avg_df['RATING'].dropna().empty:
+            avg_rating = avg_df.groupby('VARIETY', dropna=False)['RATING'].mean().reindex(ALLOWED_VARIETIES).reset_index()
+            # drop NA rows (varieties not present)
+            avg_rating = avg_rating.dropna(subset=['RATING'])
             bar_fig = px.bar(avg_rating, x='VARIETY', y='RATING',
                              title="Average Rating per Variety",
                              color='VARIETY', labels={'RATING': 'Average Rating'},
@@ -379,9 +386,13 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         else:
             bar_fig = empty_fig
 
-        # Distribution by numeric RATING
+        # Distribution by numeric RATING - show all records but color by variety (only allowed varieties colored;
+        # others will show but not be in legend because we color only allowed ones)
         if 'RATING' in filtered_df.columns and not filtered_df['RATING'].dropna().empty:
-            dist_fig = px.histogram(filtered_df, x='RATING', color='VARIETY', barmode='overlay', nbins=5,
+            # create a masked column that retains allowed varieties else labels as 'Other (hidden)'
+            plot_df = filtered_df.copy()
+            plot_df['VARIETY_PLOT'] = plot_df['VARIETY'].where(plot_df['VARIETY'].isin(ALLOWED_VARIETIES), other=None)
+            dist_fig = px.histogram(plot_df, x='RATING', color='VARIETY_PLOT', barmode='overlay', nbins=5,
                                     title="Rating Distribution by Variety",
                                     color_discrete_sequence=px.colors.sequential.Tealgrn_r)
             dist_fig.update_traces(opacity=0.7)
@@ -389,26 +400,39 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         else:
             dist_fig = empty_fig
 
-        # Buying counts
+        # Buying counts: only include BUYING values that are in allowed varieties and not null
         if 'BUYING' in filtered_df.columns:
-            buying_counts = filtered_df['BUYING'].astype(str).value_counts(dropna=False).reset_index()
-            buying_counts.columns = ['VARIETY', 'Count']
-            buy_fig = px.bar(buying_counts, x='VARIETY', y='Count', title="Willingness to Buy by Variety",
-                             color='VARIETY', color_discrete_sequence=px.colors.sequential.Magma_r)
-            buy_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
+            buy_series = filtered_df['BUYING'].dropna().astype(str)
+            buy_series = buy_series[buy_series.isin(ALLOWED_VARIETIES)]
+            if not buy_series.empty:
+                buying_counts = buy_series.value_counts().reindex(ALLOWED_VARIETIES).fillna(0).reset_index()
+                buying_counts.columns = ['VARIETY', 'Count']
+                # drop zero counts to keep chart tidy
+                buying_counts = buying_counts[buying_counts['Count'] > 0]
+                buy_fig = px.bar(buying_counts, x='VARIETY', y='Count', title="Willingness to Buy by Variety",
+                                 color='VARIETY', color_discrete_sequence=px.colors.sequential.Magma_r)
+                buy_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff')
+            else:
+                buy_fig = empty_fig
         else:
             buy_fig = empty_fig
 
-        # summary cards
+        # summary cards - count only allowed varieties for unique varieties
         card_style = {
             "padding": "20px", "margin": "15px", "border": "2px solid #444",
             "borderRadius": "10px", "width": "220px", "textAlign": "center",
             "boxShadow": "0px 4px 15px rgba(0,0,0,0.4)", "backgroundColor": "#2e2e2e", "color": "#f2f2f2"
         }
+        total_records = int(len(filtered_df))
+        avg_rating_val = (round(float(filtered_df['RATING'].mean()), 2) if 'RATING' in filtered_df.columns and not filtered_df['RATING'].dropna().empty else "—")
+        # Unique varieties: only count allowed varieties that are present in filtered_df
+        present_allowed = set([v for v in filtered_df.get('VARIETY', pd.Series([], dtype=object)).dropna().unique()]) & ALLOWED_VARIETIES_SET
+        unique_varieties = len(present_allowed)
+
         cards = [
-            html.Div([html.H4("Total Records"), html.P(int(len(filtered_df)))], style=card_style),
-            html.Div([html.H4("Average Rating"), html.P(round(float(filtered_df['RATING'].mean()), 2))], style=card_style) if 'RATING' in filtered_df.columns and not filtered_df['RATING'].dropna().empty else html.Div([html.H4("Average Rating"), html.P("—")], style=card_style),
-            html.Div([html.H4("Unique Varieties"), html.P(int(filtered_df['VARIETY'].nunique(dropna=True)))], style=card_style) if 'VARIETY' in filtered_df.columns else html.Div([html.H4("Unique Varieties"), html.P("—")], style=card_style)
+            html.Div([html.H4("Total Records"), html.P(total_records)], style=card_style),
+            html.Div([html.H4("Average Rating"), html.P(avg_rating_val)], style=card_style),
+            html.Div([html.H4("Unique Varieties"), html.P(unique_varieties)], style=card_style)
         ]
 
     # Options for dropdowns (districts: robust sorted; variety: only allowed 13 in set order)

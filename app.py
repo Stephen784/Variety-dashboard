@@ -290,7 +290,7 @@ app.layout = html.Div([
         ], style={"width": "45%", "display": "inline-block", "padding": "10px"}),
 
         html.Div([
-            html.Label("Select Variety:", style={"fontWeight": "bold", "color": "#ffffff"}),
+            html.Label("Select Variety:", style={"fontWeight": "bold","color":"#ffffff"}),
             dcc.Dropdown(
                 id='variety-dropdown',
                 options=get_allowed_variety_options_always_show_all(df),
@@ -303,33 +303,33 @@ app.layout = html.Div([
 
     html.Br(),
 
-    html.Div(id='summary-cards', style={"display": "flex", "justifyContent": "center", "flexWrap": "wrap"}),
+    html.Div(id='summary-cards', style={"display":"flex","justifyContent":"center","flexWrap":"wrap"}),
 
     html.Br(),
 
     dcc.Graph(id='bar-chart', config={"displayModeBar": False}),
     dcc.Graph(id='rating-distribution', config={"displayModeBar": False}),
     dcc.Graph(id='variety-buying-bar', config={"displayModeBar": False})
-], style={"backgroundColor": "#1e1e1e", "padding": "30px"})
+], style={"backgroundColor":"#1e1e1e","padding":"30px"})
 
 # -------------------------
 # Callback
 # -------------------------
 @app.callback(
     [
-        Output('bar-chart', 'figure'),
-        Output('rating-distribution', 'figure'),
-        Output('variety-buying-bar', 'figure'),
-        Output('district-dropdown', 'options'),
-        Output('variety-dropdown', 'options'),
-        Output('summary-cards', 'children')
+        Output('bar-chart','figure'),
+        Output('rating-distribution','figure'),
+        Output('variety-buying-bar','figure'),
+        Output('district-dropdown','options'),
+        Output('variety-dropdown','options'),
+        Output('summary-cards','children')
     ],
     [
-        Input('upload-data', 'contents'),
-        Input('district-dropdown', 'value'),
-        Input('variety-dropdown', 'value')
+        Input('upload-data','contents'),
+        Input('district-dropdown','value'),
+        Input('variety-dropdown','value')
     ],
-    State('upload-data', 'filename')
+    State('upload-data','filename')
 )
 def update_dashboard(contents, selected_district, selected_variety, filename):
     global df
@@ -350,15 +350,16 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
             df_new = map_varieties(df_new)
             df_new = canonicalize_varieties_and_buying_aggressive(df_new)
             df_new = normalize_rating_column_inplace(df_new)
-            df_new = normalize_text_columns_to_str(df_new, ["VARIETY", "BUYING", "DISTRICT"])
+            df_new = normalize_text_columns_to_str(df_new, ["VARIETY","BUYING","DISTRICT"])
             df = df_new
         except Exception as e:
-            err = html.Div(f"Upload error: {e}", style={"color": "#ff6b6b"})
+            err = html.Div(f"Upload error: {e}", style={"color":"#ff6b6b"})
             return empty_fig, empty_fig, empty_fig, [], get_allowed_variety_options_always_show_all(df), [err]
 
     if df is None or df.empty:
         return empty_fig, empty_fig, empty_fig, [], get_allowed_variety_options_always_show_all(df), empty_cards
 
+    # Filtering: district filter applied to filtered_df except buy-chart uses special logic below
     filtered_df = df.copy()
     if selected_district and 'DISTRICT' in filtered_df.columns:
         filtered_df = filtered_df[filtered_df['DISTRICT'].apply(lambda x: normalize_for_matching(x) == normalize_for_matching(selected_district))]
@@ -369,7 +370,7 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         bar_fig, dist_fig, buy_fig = empty_fig, empty_fig, empty_fig
         cards = empty_cards
     else:
-        # Average rating per variety: include only allowed varieties and rotate labels
+        # Average rating per variety
         avg_df = filtered_df[filtered_df['VARIETY'].isin(ALLOWED_VARIETIES)]
         if 'VARIETY' in avg_df.columns and 'RATING' in avg_df.columns and not avg_df['RATING'].dropna().empty:
             avg_rating = avg_df.groupby('VARIETY', dropna=False)['RATING'].mean().reindex(ALLOWED_VARIETIES).reset_index()
@@ -395,33 +396,57 @@ def update_dashboard(contents, selected_district, selected_variety, filename):
         else:
             dist_fig = empty_fig
 
-        # Buying counts: only allowed varieties (exclude None / unknown). Sort descending.
-        if 'BUYING' in filtered_df.columns:
-            buy_series = filtered_df['BUYING'].dropna().astype(str)
-            buy_series = buy_series[buy_series.isin(ALLOWED_VARIETIES)]
-            if not buy_series.empty:
-                buying_counts = buy_series.value_counts().reindex(ALLOWED_VARIETIES).fillna(0).reset_index()
-                buying_counts.columns = ['VARIETY', 'Count']
-                buying_counts = buying_counts[buying_counts['Count'] > 0]
-                # sort descending (most wanted -> least wanted)
-                buying_counts = buying_counts.sort_values('Count', ascending=False)
-                order = buying_counts['VARIETY'].tolist()
-                buy_fig = px.bar(buying_counts, x='VARIETY', y='Count', title="Willingness to Buy by Variety",
-                                 color='VARIETY', category_orders={'VARIETY': order},
-                                 color_discrete_sequence=px.colors.sequential.Magma_r)
-                buy_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff',
-                                      xaxis_tickangle=-45)
+        # Buying counts: SPECIAL LOGIC
+        # - If a variety is selected: show only that selected variety aggregated across ALL districts (use global df)
+        # - If no variety selected: show allowed varieties counts based on filtered_df (which may be district-filtered)
+        if 'BUYING' in df.columns:
+            if selected_variety:
+                # use global df to aggregate across all districts (so district filter does not restrict this chart)
+                buy_source = df
+                buy_series = buy_source['BUYING'].dropna().astype(str)
+                # keep only allowed varieties
+                buy_series = buy_series[buy_series.isin(ALLOWED_VARIETIES)]
+                # filter to the selected variety only
+                buy_series = buy_series[buy_series == selected_variety]
+                if not buy_series.empty:
+                    buying_counts = buy_series.value_counts().reindex([selected_variety]).fillna(0).reset_index()
+                    buying_counts.columns = ['VARIETY', 'Count']
+                    buying_counts = buying_counts[buying_counts['Count'] > 0]
+                    # one-bar chart (selected variety)
+                    buy_fig = px.bar(buying_counts, x='VARIETY', y='Count', title=f"Willingness to Buy — {selected_variety}",
+                                     color='VARIETY', category_orders={'VARIETY': [selected_variety]},
+                                     color_discrete_sequence=px.colors.sequential.Magma_r)
+                    buy_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff',
+                                          xaxis_tickangle=-45)
+                else:
+                    buy_fig = empty_fig
             else:
-                buy_fig = empty_fig
+                # no variety selected: show counts from filtered_df (respecting district filter)
+                buy_series = filtered_df['BUYING'].dropna().astype(str)
+                buy_series = buy_series[buy_series.isin(ALLOWED_VARIETIES)]
+                if not buy_series.empty:
+                    buying_counts = buy_series.value_counts().reindex(ALLOWED_VARIETIES).fillna(0).reset_index()
+                    buying_counts.columns = ['VARIETY', 'Count']
+                    buying_counts = buying_counts[buying_counts['Count'] > 0]
+                    buying_counts = buying_counts.sort_values('Count', ascending=False)
+                    order = buying_counts['VARIETY'].tolist()
+                    buy_fig = px.bar(buying_counts, x='VARIETY', y='Count', title="Willingness to Buy by Variety",
+                                     color='VARIETY', category_orders={'VARIETY': order},
+                                     color_discrete_sequence=px.colors.sequential.Magma_r)
+                    buy_fig.update_layout(showlegend=False, plot_bgcolor='#262626', paper_bgcolor='#1e1e1e', font_color='#ffffff',
+                                          xaxis_tickangle=-45)
+                else:
+                    buy_fig = empty_fig
         else:
             buy_fig = empty_fig
 
-        # summary cards - Unique Varieties label exactly and show just 13
+        # summary cards - Unique Varieties label showing present_count/13
         card_style = {"padding":"20px","margin":"15px","border":"2px solid #444","borderRadius":"10px","width":"220px","textAlign":"center","boxShadow":"0px 4px 15px rgba(0,0,0,0.4)","backgroundColor":"#2e2e2e","color":"#f2f2f2"}
         total_records = int(len(filtered_df))
         avg_rating_val = (round(float(filtered_df['RATING'].mean()), 2) if 'RATING' in filtered_df.columns and not filtered_df['RATING'].dropna().empty else "—")
-        # display just the number 13 as requested
-        unique_varieties_display = len(ALLOWED_VARIETIES)
+        present_allowed = set([v for v in filtered_df.get('VARIETY', pd.Series([], dtype=object)).dropna().unique()]) & ALLOWED_VARIETIES_SET
+        present_count = len(present_allowed)
+        unique_varieties_display = f"{present_count}/{len(ALLOWED_VARIETIES)}"  # <-- present/13 format
         cards = [
             html.Div([html.H4("Total Records"), html.P(total_records)], style=card_style),
             html.Div([html.H4("Average Rating"), html.P(avg_rating_val)], style=card_style),
